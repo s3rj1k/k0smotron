@@ -1975,3 +1975,37 @@ func TestHostedReconcileDeletePersistsFinalizerRemoval(t *testing.T) {
 		require.True(t, apierrors.IsNotFound(err))
 	}
 }
+
+// TestHostedReconcileHoldsObservedGenerationOnAStatusError covers the staleness signal
+// not being recorded when the status behind it was never computed.
+func TestHostedReconcileHoldsObservedGenerationOnAStatusError(t *testing.T) {
+	cluster, kcp, kmc := hostedReconcileFixture()
+	// Set explicitly, since a zero generation would let the assertion below pass for
+	// the wrong reason.
+	kcp.Generation = 7
+
+	c := &K0smotronController{
+		Client: fake.NewClientBuilder().WithScheme(hostedStatusScheme(t)).
+			WithObjects(cluster, kcp, kmc).
+			WithStatusSubresource(cluster, kcp).
+			WithInterceptorFuncs(failPodList()).Build(),
+		ClusterCache: stubClusterCache{err: errors.New("connection refused")},
+	}
+
+	req := ctrl.Request{NamespacedName: client.ObjectKey{Namespace: "default", Name: "test"}}
+
+	// The first pass records the paused condition and asks to be called again, so the
+	// status computation that fails runs on the second one.
+	_, err := c.Reconcile(t.Context(), req)
+	require.NoError(t, err)
+
+	_, err = c.Reconcile(t.Context(), req)
+	require.ErrorContains(t, err, "status boom")
+
+	persisted := &cpv1beta2.K0smotronControlPlane{}
+	require.NoError(t, c.Get(t.Context(), req.NamespacedName, persisted))
+
+	require.EqualValues(t, 7, persisted.Generation)
+	require.Zero(t, persisted.Status.ObservedGeneration,
+		"the field would claim the reported status was computed from a generation it never reached")
+}
